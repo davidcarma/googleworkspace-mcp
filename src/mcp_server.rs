@@ -111,8 +111,7 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
 
-    // Cache to hold generated tools configuration so we do not spam fetch from Google discovery
-    let mut tools_cache = None;
+    let mut tools_cache: Option<ToolRegistry> = None;
 
     while let Ok(Some(line)) = stdin.next_line().await {
         if line.trim().is_empty() {
@@ -183,11 +182,44 @@ pub async fn start(args: &[String]) -> Result<(), GwsError> {
     Ok(())
 }
 
+/// Holds the built tools list plus a reverse map from shortened names to originals.
+struct ToolRegistry {
+    tools: Vec<Value>,
+    name_map: HashMap<String, String>,
+}
+
+/// Abbreviate well-known long Discovery Document segment names so the combined
+/// Cursor limit of 60 chars (server_name + ": " + tool_name) is respected.
+fn shorten_segment(seg: &str) -> &str {
+    match seg {
+        "addOnAttachments" => "aoa",
+        "studentSubmissions" => "stuSubs",
+        "courseWorkMaterials" => "cwMats",
+        "participantSessions" => "pSess",
+        "conferenceRecords" => "confRecs",
+        "sanitizeModelResponse" => "sanitModelResp",
+        "sanitizeUserPrompt" => "sanitUserPr",
+        "studentGroupMembers" => "groupMems",
+        "searchTransitiveMemberships" => "searchTransMems",
+        "checkTransitiveMembership" => "checkTransMem",
+        "printServers" => "prtSvrs",
+        "batchDeletePrintServers" => "batchDelPrtSvrs",
+        "batchCreatePrintServers" => "batchCrPrtSvrs",
+        "inboundSamlSsoProfiles" => "inboundSamlSso",
+        "idpCredentials" => "idpCreds",
+        other => other,
+    }
+}
+
+fn shorten_tool_name(name: &str) -> String {
+    name.split('-').map(shorten_segment).collect::<Vec<_>>().join("-")
+}
+
 async fn handle_request(
     method: &str,
     params: &Value,
     config: &ServerConfig,
-    tools_cache: &mut Option<Vec<Value>>,
+    tools_cache: &mut Option<ToolRegistry>,
 ) -> Result<Value, GwsError> {
     match method {
         "initialize" => Ok(json!({
@@ -209,14 +241,18 @@ async fn handle_request(
                 *tools_cache = Some(build_tools_list(config).await?);
             }
             Ok(json!({
-                "tools": tools_cache.as_ref().unwrap()
+                "tools": tools_cache.as_ref().unwrap().tools
             }))
         }
         "tools/call" => {
             // MCP spec: tool execution errors should be returned as successful results
             // with isError: true, NOT as JSON-RPC protocol errors. Returning JSON-RPC
             // errors causes clients to show generic "Tool execution failed" with no detail.
-            match handle_tools_call(params, config).await {
+            if tools_cache.is_none() {
+                *tools_cache = Some(build_tools_list(config).await?);
+            }
+            let name_map = &tools_cache.as_ref().unwrap().name_map;
+            match handle_tools_call(params, config, name_map).await {
                 Ok(val) => Ok(val),
                 Err(e) => Ok(json!({
                     "content": [{ "type": "text", "text": e.to_string() }],
@@ -231,19 +267,21 @@ async fn handle_request(
     }
 }
 
-async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
+async fn build_tools_list(config: &ServerConfig) -> Result<ToolRegistry, GwsError> {
     if config.tool_mode == ToolMode::Compact {
-        return build_compact_tools_list(config).await;
+        let tools = build_compact_tools_list(config).await?;
+        return Ok(ToolRegistry { tools, name_map: HashMap::new() });
     }
 
     let mut tools = Vec::new();
+    let mut name_map: HashMap<String, String> = HashMap::new();
 
     // 1. Walk core services
     for svc_name in &config.services {
         let (api_name, version) =
             crate::parse_service_and_version(&[svc_name.to_string()], svc_name)?;
         if let Ok(doc) = crate::discovery::fetch_discovery_document(&api_name, &version).await {
-            walk_resources(svc_name, &doc.resources, &mut tools);
+            walk_resources(svc_name, &doc.resources, &mut tools, &mut name_map);
         } else {
             eprintln!("[gws mcp] Warning: Failed to load discovery document for service '{}'. It will not be available as a tool.", svc_name);
         }
@@ -254,7 +292,7 @@ async fn build_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError>
         append_workflow_tools(&mut tools);
     }
 
-    Ok(tools)
+    Ok(ToolRegistry { tools, name_map })
 }
 
 async fn build_compact_tools_list(config: &ServerConfig) -> Result<Vec<Value>, GwsError> {
@@ -415,12 +453,23 @@ fn append_workflow_tools(tools: &mut Vec<Value>) {
     }));
 }
 
-fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools: &mut Vec<Value>) {
+fn walk_resources(
+    prefix: &str,
+    resources: &HashMap<String, RestResource>,
+    tools: &mut Vec<Value>,
+    name_map: &mut HashMap<String, String>,
+) {
     for (res_name, res) in resources {
         let new_prefix = format!("{}-{}", prefix, res_name);
 
         for (method_name, method) in &res.methods {
-            let tool_name = format!("{}-{}", new_prefix, method_name);
+            let original_name = format!("{}-{}", new_prefix, method_name);
+            let tool_name = shorten_tool_name(&original_name);
+
+            // Store reverse mapping only when segments were actually shortened
+            if tool_name != original_name {
+                name_map.insert(tool_name.clone(), original_name);
+            }
             let mut description = method.description.clone().unwrap_or_default();
             if description.is_empty() {
                 description = format!("Execute the {} Google API method", tool_name);
@@ -477,7 +526,7 @@ fn walk_resources(prefix: &str, resources: &HashMap<String, RestResource>, tools
 
         // Recurse into sub-resources
         if !res.resources.is_empty() {
-            walk_resources(&new_prefix, &res.resources, tools);
+            walk_resources(&new_prefix, &res.resources, tools, name_map);
         }
     }
 }
@@ -655,7 +704,7 @@ fn find_resource<'a>(
     Some(current_res)
 }
 
-async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Value, GwsError> {
+async fn handle_tools_call(params: &Value, config: &ServerConfig, name_map: &HashMap<String, String>) -> Result<Value, GwsError> {
     let tool_name = params
         .get("name")
         .and_then(|n| n.as_str())
@@ -714,7 +763,16 @@ async fn handle_tools_call(params: &Value, config: &ServerConfig) -> Result<Valu
         return execute_mcp_method(&doc, method, arguments).await;
     }
 
-    // Full mode: tool_name encodes service-resource-method (e.g., drive-files-list)
+    // Full mode: tool_name encodes service-resource-method (e.g., drive-files-list).
+    // If the name was shortened, resolve it to the original before dispatching.
+    let resolved;
+    let tool_name = if let Some(original) = name_map.get(tool_name) {
+        resolved = original.clone();
+        resolved.as_str()
+    } else {
+        tool_name
+    };
+
     // Find the enabled service that is a prefix of the tool name.
     // This correctly handles hyphenated aliases like "admin-reports".
     let (svc_alias, rest) = config
