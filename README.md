@@ -456,6 +456,114 @@ If a required Google API is not enabled for your GCP project, you will see a
 > You can also run `gws auth setup` which walks you through enabling all required
 > APIs for your project automatically.
 
+## Fork Maintenance (Cursor Patch)
+
+This fork (`davidcarma/googleworkspace-mcp`) adds a patch on the `cursor-mcp-patch` branch that shortens deeply-nested MCP tool names so they fit within [Cursor](https://cursor.sh)'s 60-character combined `server: tool` limit.
+
+### What the patch does
+
+Cursor enforces a strict 60-character limit on the combined `server_name: tool_name` string. With the MCP server named `gws` (3 chars + `: ` = 5 overhead), tool names must be at most 55 characters. A handful of Google APIs produce deeply-nested resource paths that exceed this - for example:
+
+```
+classroom-courses-courseWork-addOnAttachments-studentSubmissions-patch  (70 chars)
+```
+
+The patch adds a `shorten_segment()` function that abbreviates 15 well-known long segment names with readable aliases, and a `ToolRegistry` that stores a reverse map so shortened names resolve back to the correct Discovery Document resource paths at call time.
+
+| Original segment | Abbreviated |
+|---|---|
+| `addOnAttachments` | `aoa` |
+| `studentSubmissions` | `stuSubs` |
+| `courseWorkMaterials` | `cwMats` |
+| `participantSessions` | `pSess` |
+| `conferenceRecords` | `confRecs` |
+| `sanitizeModelResponse` | `sanitModelResp` |
+| `sanitizeUserPrompt` | `sanitUserPr` |
+| `studentGroupMembers` | `groupMems` |
+| `searchTransitiveMemberships` | `searchTransMems` |
+| `checkTransitiveMembership` | `checkTransMem` |
+| `printServers` | `prtSvrs` |
+| `batchDeletePrintServers` | `batchDelPrtSvrs` |
+| `batchCreatePrintServers` | `batchCrPrtSvrs` |
+| `inboundSamlSsoProfiles` | `inboundSamlSso` |
+| `idpCredentials` | `idpCreds` |
+
+Result: **724 tools exposed, zero over the 60-char limit.**
+
+### Branch layout
+
+| Branch | Based on | Purpose |
+|---|---|---|
+| `main` | `upstream/main` | Mirrors upstream `googleworkspace/cli` |
+| `cursor-mcp-patch` | `upstream/fix/mcp-hyphen-tool-names` | Our patch - this is what you build and run |
+
+### Initial setup (Cursor + macOS)
+
+```bash
+# 1. Clone the fork
+git clone https://github.com/davidcarma/googleworkspace-mcp.git ~/Desktop/code/googleworkspace-mcp
+cd ~/Desktop/code/googleworkspace-mcp
+
+# 2. Add upstream so you can pull future updates
+git remote add upstream https://github.com/googleworkspace/cli.git
+
+# 3. Switch to the patched branch
+git checkout cursor-mcp-patch
+
+# 4. Build (requires Rust - install via https://rustup.rs if needed)
+cargo build --release
+
+# 5. Copy the binary
+cp target/release/gws ~/bin/gws-patched
+chmod +x ~/bin/gws-patched
+```
+
+Configure your Cursor MCP (`.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` globally):
+
+```json
+{
+  "mcpServers": {
+    "gws": {
+      "command": "/Users/YOUR_USERNAME/bin/gws-mcp-gmail"
+    }
+  }
+}
+```
+
+Where `~/bin/gws-mcp-gmail` is a wrapper script:
+
+```zsh
+#!/bin/zsh
+set -euo pipefail
+export PATH="$HOME/.nvm/versions/node/v22.17.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export GOOGLE_WORKSPACE_CLI_CONFIG_DIR="$HOME/.config/gws"
+exec "$HOME/bin/gws-patched" mcp -s all --tool-mode full --workflows --helpers "$@"
+```
+
+### Syncing with upstream updates
+
+When `googleworkspace/cli` releases a new version:
+
+```bash
+cd ~/Desktop/code/googleworkspace-mcp
+
+# Pull latest upstream changes
+git fetch upstream
+
+# Rebase our patch on top of the new upstream branch
+git checkout cursor-mcp-patch
+git rebase upstream/main        # or upstream/fix/mcp-hyphen-tool-names if still open
+
+# Rebuild and deploy
+cargo build --release
+cp target/release/gws ~/bin/gws-patched
+
+# Push the rebased branch back to the fork
+git push origin cursor-mcp-patch --force-with-lease
+```
+
+If upstream adds new services with long tool names, add their segments to `shorten_segment()` in `src/mcp_server.rs` and rebuild.
+
 ## Development
 
 ```bash
